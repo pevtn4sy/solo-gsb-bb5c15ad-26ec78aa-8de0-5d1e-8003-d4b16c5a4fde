@@ -291,6 +291,22 @@ def create_rule(rule: RuleIn) -> dict:
     return db.fetch_rule(rule_id)
 
 
+class RulePreviewIn(RuleIn):
+    # Null for a brand-new rule: the original side is then the empty fault set.
+    rule_id: int | None = None
+
+
+@app.post("/api/rules/preview")
+def preview_rule(payload: RulePreviewIn) -> dict:
+    """Read-only impact preview: evaluate the stored rule (if any) and the
+    unsaved draft against current events and planned maintenance, then diff
+    their confirmed faults over half-open intervals. Writes nothing."""
+    try:
+        return services.preview_rule(payload.rule_id, payload.normalized())
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @app.get("/api/rules/{rule_id}")
 def get_rule(rule_id: int) -> dict:
     rule = db.fetch_rule(rule_id)

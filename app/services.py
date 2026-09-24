@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from collections import defaultdict
+from typing import Any
 
 from . import db
 from .engine import (
@@ -13,6 +14,7 @@ from .engine import (
     Interval,
     MaintenanceWindow,
     cluster_intervals,
+    diff_fault_sets,
     evaluate_rule,
     to_epoch,
     to_number,
@@ -251,6 +253,76 @@ def evaluate_all_rules() -> dict:
         "suppressed_segments": total_suppressed,
         "maintenance_windows": len(maintenance),
         "per_rule": per_rule,
+    }
+
+
+def _minimal_fault(f: Any) -> dict:
+    """The fields the impact-preview diff needs (no evidence payload)."""
+    return {
+        "start": f.start,
+        "end": f.end,
+        "duration_required": f.duration_required,
+        "confirmed_at": f.confirmed_at,
+    }
+
+
+def preview_rule(rule_id: int | None, draft: dict) -> dict:
+    """Evaluate the stored rule and an unsaved draft side by side.
+
+    Both sides are evaluated against the *current* events and planned
+    maintenance windows; nothing is written to the rules or fault tables.
+    For a brand-new rule (``rule_id is None``) the "original" side is empty.
+    Returns the half-open interval diff of the two confirmed fault sets.
+    """
+    events_by_channel, horizon = _load_events_index()
+    if horizon is None:
+        horizon = 0.0
+    maintenance = _load_maintenance_windows()
+
+    original = db.fetch_rule(rule_id) if rule_id is not None else None
+    if rule_id is not None and original is None:
+        raise KeyError("rule not found")
+
+    def run(rule_def: dict, rid: int) -> list:
+        return evaluate_rule(
+            rule_id=rid,
+            logic=rule_def["logic"],
+            duration_required=rule_def["duration"],
+            conditions=[Condition.from_dict(c) for c in rule_def["conditions"]],
+            events_by_channel=events_by_channel,
+            horizon=horizon,
+            maintenance=maintenance,
+        ).faults
+
+    before_faults = run(original, rule_id) if original else []
+    after_faults = run(draft, rule_id if rule_id is not None else 0)
+    diff = diff_fault_sets(before_faults, after_faults)
+
+    return {
+        "rule_id": rule_id,
+        "is_new_rule": original is None,
+        "evaluated_at": time.time(),
+        "maintenance_windows": len(maintenance),
+        "note": "只读预览：基于当前事件与计划维护分别评估原规则与草稿，未写入规则或故障表",
+        "original_rule": (
+            {
+                "name": original["name"],
+                "logic": original["logic"],
+                "duration": original["duration"],
+                "conditions": original["conditions"],
+            }
+            if original
+            else None
+        ),
+        "draft_rule": {
+            "name": draft["name"],
+            "logic": draft["logic"],
+            "duration": draft["duration"],
+            "conditions": draft["conditions"],
+        },
+        "faults_before": [_minimal_fault(f) for f in before_faults],
+        "faults_after": [_minimal_fault(f) for f in after_faults],
+        "diff": diff.to_dict(),
     }
 
 

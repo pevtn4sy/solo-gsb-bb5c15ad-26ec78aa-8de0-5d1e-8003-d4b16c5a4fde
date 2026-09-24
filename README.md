@@ -23,8 +23,8 @@ docker compose up --build
 
 启动后访问：
 
-- **地址 / 端口：http://localhost:8000**
-- API 文档（Swagger UI）：http://localhost:8000/docs
+- **Web 地址：http://localhost:8000**
+- **API 文档（Swagger UI）：http://localhost:8000/docs**
 - 健康检查：http://localhost:8000/api/health
 
 数据保存在 Docker 卷 `sensor-data` 内的 SQLite 文件 `/data/sensor.db`，容器重启不丢失。
@@ -66,6 +66,21 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 4. 在时间轴上**按住拖拽**框选一段时间，填写名称即可创建区间标注；框选弹层里切换到
    **「维护窗口」** 并填写设备，即可直接创建计划维护窗口。
 5. 点击故障色块或故障行，展开每个条件的触发样本证据；再点 **「导出 JSON」** 下载完整结果。
+
+### 保存前先「预览影响」
+
+在规则编辑弹层（新建或编辑）中改好名称、条件或持续时长后，先点 **「预览影响」**，无需保存即可看到
+草稿会带来的故障变化；继续编辑任意字段后预览会失效，需重新点击：
+
+- 后端把**未保存草稿**提交到只读接口 `POST /api/rules/preview`，按**当前事件和计划维护**分别评估
+  **原规则**与**草稿**（新建规则的原规则侧为空），**不写入**规则表、故障表或维护表。
+- 两侧已确认故障按**半开区间** `[start,end)` 做扫描线比较，返回三类差异与无变化片段：
+  - 🟢 **新增故障片段**：仅草稿命中（含原故障延长/扩出的部分）；
+  - 🔴 **消失故障片段**：仅原规则命中（含原故障被缩短/切断后失去的部分）；
+  - 🟡 **确认时刻变化**：重叠片段即使区间边界完全没变，只要确认时刻 `confirmed_at = start + 持续时长`
+    不同也会标出，并同时给出**两侧确认时刻**（改持续时长、维护重置导致起点平移都会命中）；
+  - 另有「无变化」折叠区列出区间与确认时刻完全一致的片段；若无任何差异则直接显示**无变化状态**。
+- 预览结果只用于展示；点 **「保存」** 仍沿用原写入流程（保存后按原逻辑刷新，维护变更仍会自动重评估）。
 
 ### 试试计划维护
 
@@ -116,6 +131,24 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 长度 `end-start ≥ 持续时长` 的真值段才成为故障区间。
 - **确认时刻** `confirmed_at = start + 持续时长`（即持续满指定时长的那一刻；时间轴上用 ▴ 标出）。
 - 每条故障区间附带**逐条件证据**：该故障内命中的原始样本（event_id / 时间 / 值）与条件成立的子区间。
+
+## 预览影响（只读对比）
+
+`POST /api/rules/preview` 的请求体与新建/编辑规则相同，另加可选的 `rule_id`（编辑时传当前规则 id；
+新建规则时为 `null`）。服务端在**同一次请求内**：
+
+1. 载入当前全部事件（同一 horizon）与当前**计划维护**窗口（同样先合并、再扣除、重置持续时长）；
+2. 用已保存的原规则（若有）和草稿各跑一次 `evaluate_rule`，得到两侧**已确认故障**（已过持续时长门槛）；
+3. 对两侧故障做半开区间覆盖的扫描线比较，逐段输出：
+   `added`（仅草稿）、`removed`（仅原规则）、`confirmation_changed`（两侧都覆盖但确认时刻不同，
+   携带 `confirmed_at_before/after` 与两侧 `duration_required_*`）、`unchanged`（覆盖与确认时刻均一致）；
+   每段都是 `[start,end)` 半开片段，首尾相接的区间不产生零长度片段。
+4. 全程只执行读查询与内存计算：不插入/更新/删除 `rules`、`rule_conditions`、`fault_intervals`、
+   `suppressed_segments` 或维护表；保存仍走原来的 `POST/PUT /api/rules` 流程。
+
+响应同时给出 `faults_before` / `faults_after`（不含证据的精简区间）、`diff.counts`、`has_changes`、
+`maintenance_windows`（参与评估的维护窗口数）与只读提示。典型场景：改大持续时长时常得到
+`confirmation_changed`（同一区间、确认时刻后移）；被维护切断后幸存片段若不达标则表现为 `removed`。
 
 ## 计划维护
 
@@ -225,6 +258,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET /api/channels` | 通道列表及值范围 |
 | `GET /api/events?start&end&device&metric&limit&offset` | 原始事件（时间含端点，分页） |
 | `GET/POST /api/rules`，`GET/PUT/DELETE /api/rules/{id}` | 规则增删改查 |
+| `POST /api/rules/preview` | 只读「预览影响」：按当前事件与计划维护分别评估原规则（`rule_id` 为 null 时原侧为空）与未保存草稿，半开区间对比已确认故障，返回新增/消失/确认时刻变化/无变化片段，不写入任何表 |
 | `POST /api/evaluate` | 重新评估全部规则，重算故障区间与证据 |
 | `GET /api/faults?start&end` | 故障区间（含证据，半开相交筛选；已扣除维护） |
 | `GET /api/fault-events?start&end` | 故障事件：跨规则重叠/首尾相接（传递）归并，含成员故障与原证据 |
@@ -253,7 +287,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```
 app/
-  engine.py           # 半开区间、扫描线 AND/OR 合并、持续时长过滤、证据、维护扣除/抑制、区间聚类（事件归并）
+  engine.py           # 半开区间、扫描线 AND/OR 合并、持续时长过滤、证据、维护扣除/抑制、区间聚类（事件归并）、预览影响差异对比
   db.py               # SQLite 连接、建表、基础查询
   services.py         # JSONL 导入、规则评估、时间轴抽样、筛选、故障事件归并、被抑制片段、导出
   main.py             # FastAPI 路由与静态页面
@@ -261,9 +295,11 @@ app/
 samples/
   telemetry.jsonl     # 示例数据（generate_sample.py 可再生成）
 tests/
-  test_engine.py        # 引擎单元测试（pytest）
-  test_fault_events.py  # 故障事件归并、传递链、窗口语义测试
-  test_maintenance.py   # 维护窗口合并/扣除、持续时长重置、证据边界、被抑制片段测试
+  test_engine.py            # 引擎单元测试（pytest）
+  test_fault_events.py      # 故障事件归并、传递链、窗口语义测试
+  test_maintenance.py       # 维护窗口合并/扣除、持续时长重置、证据边界、被抑制片段测试
+  test_rule_preview.py      # 预览影响：半开区间新增/消失/确认时刻变化/无变化对比测试
+  test_rule_preview_service.py  # 预览只读性（不写规则/故障表）、计划维护参与评估的服务级测试
 Dockerfile / docker-compose.yml / requirements.txt
 ```
 
@@ -276,5 +312,7 @@ python3 -m pytest tests/ -q
 
 测试覆盖：相接区间合并、真实缝隙不桥接、AND 相交（含同时刻边界）、OR 跨通道相接合并、
 持续时长过滤单点尖峰、缺失通道、同时间戳后值覆盖，故障事件的重叠/相接/**传递链**归并、
-事件外包区间、时间窗口成员标志与原故障不被修改，以及计划维护的窗口合并、真值扣除、
-**持续时长重置与再确认**、证据不越维护边界、被抑制片段归因（AND/OR、跨设备、相接窗口）等关键语义。
+事件外包区间、时间窗口成员标志与原故障不被修改，计划维护的窗口合并、真值扣除、
+**持续时长重置与再确认**、证据不越维护边界、被抑制片段归因（AND/OR、跨设备、相接窗口），
+以及预览影响的半开区间新增/消失/确认时刻变化（区间不变也标出两侧确认时刻）/无变化分段、
+预览只读不落库、按当前计划维护评估等关键语义。

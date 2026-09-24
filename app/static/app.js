@@ -21,6 +21,7 @@ const state = {
   selectedFaultId: null,
   editingRuleId: null,
   editingMaintenanceId: null,
+  rulePreview: null, // last read-only impact-preview response for the open editor
   eventOffset: 0,
   eventLimit: 200,
   eventTotal: 0,
@@ -163,6 +164,7 @@ function condRowHtml(c = {}) {
 
 function openEditor(ruleId = null) {
   state.editingRuleId = ruleId;
+  state.rulePreview = null;
   const rule = ruleId ? state.rules.find((r) => r.id === ruleId) : null;
   $("editor-title").textContent = rule ? "编辑规则" : "新建规则";
   $("rule-name").value = rule ? rule.name : "";
@@ -173,18 +175,31 @@ function openEditor(ruleId = null) {
   (rule ? rule.conditions : [{}]).forEach((c) => rows.insertAdjacentHTML("beforeend", condRowHtml(c)));
   bindCondRows();
   $("rule-editor").hidden = false;
+  renderRulePreview();
+}
+
+// Any edit to the draft invalidates a previously rendered preview until the
+// button is clicked again.
+function invalidateRulePreview() {
+  if (state.rulePreview) {
+    state.rulePreview = null;
+    renderRulePreview();
+  }
 }
 
 function bindCondRows() {
   $("cond-rows").querySelectorAll(".c-del").forEach((btn) =>
     btn.addEventListener("click", () => {
-      if ($("cond-rows").children.length > 1) btn.closest(".cond-row").remove();
+      if ($("cond-rows").children.length > 1) { btn.closest(".cond-row").remove(); invalidateRulePreview(); }
       else toast("至少需要一个条件", true);
     }));
+  $("cond-rows").querySelectorAll(".cond-row input, .cond-row select").forEach((inp) =>
+    inp.addEventListener("input", invalidateRulePreview));
 }
 
 function closeEditor() {
   state.editingRuleId = null;
+  state.rulePreview = null;
   $("rule-editor").hidden = true;
 }
 
@@ -217,6 +232,86 @@ async function saveRule() {
     await refreshAfterRuleChange();
     toast("规则已保存");
   } catch (e) { toast(e.message, true); }
+}
+
+/* ------------------------- read-only impact preview ------------------------- */
+
+function previewSegTime(seg) {
+  return `${fmtTime(seg.start)} → ${fmtTime(seg.end)}（${fmtDur(seg.end - seg.start)}）`;
+}
+
+function previewGroupHtml(title, cls, icon, segs, detailFn) {
+  if (!segs.length) return "";
+  return `
+    <div class="pv-group">
+      <div class="pv-group-head ${cls}">${icon} ${title} <span class="pv-count">${segs.length}</span></div>
+      ${segs.map((seg) => `<div class="pv-seg ${cls}">
+        <div class="pv-seg-time">${previewSegTime(seg)}</div>
+        <div class="pv-seg-detail">${detailFn(seg)}</div>
+      </div>`).join("")}
+    </div>`;
+}
+
+function renderRulePreview() {
+  const box = $("rule-preview");
+  const p = state.rulePreview;
+  if (!p) { box.hidden = true; box.innerHTML = ""; return; }
+  box.hidden = false;
+  const d = p.diff;
+  const head = `<div class="pv-head">预览影响：原规则 vs 当前草稿
+    <span class="muted small">（只读 · 基于当前事件${p.maintenance_windows ? `与 ${p.maintenance_windows} 个计划维护窗口` : ""} · 半开区间）</span>
+  </div>`;
+  if (!d.has_changes) {
+    box.innerHTML = `${head}<div class="pv-nochange">✓ 草稿与原规则的已确认故障完全一致：区间与确认时刻均无变化。</div>
+      <div class="pv-note">${esc(p.note)}</div>`;
+    return;
+  }
+  const html = head +
+    `<div class="pv-summary">
+      ${d.counts.added ? `<span class="pv-badge pv-added">新增 ${d.counts.added}</span>` : ""}
+      ${d.counts.removed ? `<span class="pv-badge pv-removed">消失 ${d.counts.removed}</span>` : ""}
+      ${d.counts.confirmation_changed ? `<span class="pv-badge pv-shifted">确认时刻变化 ${d.counts.confirmation_changed}</span>` : ""}
+      ${d.counts.unchanged ? `<span class="pv-badge pv-unchanged">无变化 ${d.counts.unchanged}</span>` : ""}
+    </div>` +
+    previewGroupHtml("新增故障片段（仅草稿命中）", "pv-added", "🟢", d.added,
+      (s) => `草稿确认时刻 <b>${fmtClock(s.confirmed_at_after)}</b>（持续 ≥ ${fmtDur(s.duration_required_after)}）`) +
+    previewGroupHtml("消失故障片段（仅原规则命中）", "pv-removed", "🔴", d.removed,
+      (s) => `原确认时刻 <b>${fmtClock(s.confirmed_at_before)}</b>（持续 ≥ ${fmtDur(s.duration_required_before)}）`) +
+    previewGroupHtml("确认时刻发生变化（区间仍被命中）", "pv-shifted", "🟡", d.confirmation_changed,
+      (s) => `原确认 <b>${fmtClock(s.confirmed_at_before)}</b>（≥ ${fmtDur(s.duration_required_before)}）` +
+            ` → 草稿确认 <b>${fmtClock(s.confirmed_at_after)}</b>（≥ ${fmtDur(s.duration_required_after)}）`) +
+    (d.unchanged.length
+      ? `<details class="pv-unchanged-details"><summary>无变化片段 ${d.unchanged.length} 段（区间与确认时刻一致）</summary>
+          ${d.unchanged.map((s) => `<div class="pv-seg pv-unchanged">
+            <div class="pv-seg-time">${previewSegTime(s)}</div>
+            <div class="pv-seg-detail">两侧确认时刻一致：<b>${fmtClock(s.confirmed_at_before)}</b></div>
+          </div>`).join("")}
+        </details>`
+      : "") +
+    `<div class="pv-note">${esc(p.note)}；保存仍走原流程。</div>`;
+  box.innerHTML = html;
+}
+
+async function previewRule() {
+  let payload;
+  try {
+    payload = collectRule();
+  } catch (e) { toast(e.message, true); return; }
+  const btn = $("btn-preview-rule");
+  btn.disabled = true;
+  try {
+    state.rulePreview = await api("/api/rules/preview", {
+      method: "POST",
+      body: JSON.stringify({ ...payload, rule_id: state.editingRuleId }),
+    });
+    renderRulePreview();
+  } catch (e) {
+    state.rulePreview = null;
+    renderRulePreview();
+    toast("预览失败：" + e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function deleteRule(id) {
@@ -1181,11 +1276,15 @@ function bind() {
 
   $("btn-new-rule").addEventListener("click", () => openEditor(null));
   $("btn-save-rule").addEventListener("click", saveRule);
+  $("btn-preview-rule").addEventListener("click", previewRule);
   $("btn-cancel-rule").addEventListener("click", closeEditor);
   $("btn-add-cond").addEventListener("click", () => {
     $("cond-rows").insertAdjacentHTML("beforeend", condRowHtml());
     bindCondRows();
+    invalidateRulePreview();
   });
+  ["rule-name", "rule-logic", "rule-duration"].forEach((id) =>
+    $(id).addEventListener("input", invalidateRulePreview));
 
   $("btn-new-maint").addEventListener("click", () => openMaintEditor(null));
   $("btn-save-maint").addEventListener("click", saveMaintenance);

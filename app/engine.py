@@ -342,6 +342,127 @@ class RuleEvaluation:
     suppressed: list[SuppressedSegment] = field(default_factory=list)
 
 
+# --------------------------------------------------------------------------- #
+# Read-only preview: diff two sets of confirmed faults over half-open intervals
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class FaultDiffSegment:
+    """One maximal half-open piece of the sweep-line comparison.
+
+    ``kind`` is ``added`` (draft only), ``removed`` (original only),
+    ``confirmation_changed`` (covered on both sides but the confirmation
+    instant ``start + duration`` differs) or ``unchanged`` (covered on both
+    sides with the same confirmation instant).
+    """
+
+    kind: str
+    start: float
+    end: float
+    confirmed_at_before: float | None = None
+    confirmed_at_after: float | None = None
+    duration_before: float | None = None
+    duration_after: float | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "start": self.start,
+            "end": self.end,
+            "confirmed_at_before": self.confirmed_at_before,
+            "confirmed_at_after": self.confirmed_at_after,
+            "duration_required_before": self.duration_before,
+            "duration_required_after": self.duration_after,
+        }
+
+
+@dataclass
+class FaultSetDiff:
+    added: list[FaultDiffSegment] = field(default_factory=list)
+    removed: list[FaultDiffSegment] = field(default_factory=list)
+    confirmation_changed: list[FaultDiffSegment] = field(default_factory=list)
+    unchanged: list[FaultDiffSegment] = field(default_factory=list)
+
+    @property
+    def has_changes(self) -> bool:
+        return bool(self.added or self.removed or self.confirmation_changed)
+
+    def counts(self) -> dict:
+        return {
+            "added": len(self.added),
+            "removed": len(self.removed),
+            "confirmation_changed": len(self.confirmation_changed),
+            "unchanged": len(self.unchanged),
+        }
+
+    def to_dict(self) -> dict:
+        return {
+            "has_changes": self.has_changes,
+            "counts": self.counts(),
+            "added": [s.to_dict() for s in self.added],
+            "removed": [s.to_dict() for s in self.removed],
+            "confirmation_changed": [s.to_dict() for s in self.confirmation_changed],
+            "unchanged": [s.to_dict() for s in self.unchanged],
+        }
+
+
+def diff_fault_sets(before: Iterable[Any], after: Iterable[Any]) -> FaultSetDiff:
+    """Compare two sets of confirmed faults as half-open interval covers.
+
+    Inputs are any objects with ``start`` / ``end`` / ``confirmed_at`` /
+    ``duration_required`` attributes (e.g. :class:`FaultInterval`); each side
+    is expected to be the non-overlapping output of one rule evaluation.
+
+    A sweep line walks every boundary once: between two consecutive boundaries
+    the cover is original-only (``removed``), draft-only (``added``), or
+    shared.  Shared pieces are ``unchanged`` when both confirmation instants
+    agree, otherwise ``confirmation_changed`` — carrying *both* confirmation
+    instants — even if the interval boundaries themselves never moved.
+    Touching boundaries (``[a,b)`` ending where ``[b,c)`` starts) share no
+    point in the half-open model, so no zero-length segment is emitted there.
+    """
+    groups: dict[float, list[tuple[int, int, Any]]] = defaultdict(list)
+    for side, faults in ((0, before), (1, after)):
+        for f in faults:
+            if f.end <= f.start + _EPS:
+                continue
+            groups[float(f.start)].append((side, 1, f))
+            groups[float(f.end)].append((side, -1, f))
+
+    active: list[dict[int, Any]] = [dict(), dict()]
+    diff = FaultSetDiff()
+    prev: float | None = None
+    for t in sorted(groups):
+        if prev is not None and t > prev:
+            old = next(iter(active[0].values()), None)
+            new = next(iter(active[1].values()), None)
+            kind = ""
+            cb = ca = db_ = da = None
+            if old is not None and new is not None:
+                cb, ca = old.confirmed_at, new.confirmed_at
+                db_, da = old.duration_required, new.duration_required
+                kind = "unchanged" if abs(cb - ca) <= _EPS else "confirmation_changed"
+            elif old is not None:
+                kind, cb, db_ = "removed", old.confirmed_at, old.duration_required
+            elif new is not None:
+                kind, ca, da = "added", new.confirmed_at, new.duration_required
+            if kind:
+                seg = FaultDiffSegment(
+                    kind=kind, start=prev, end=t,
+                    confirmed_at_before=cb, confirmed_at_after=ca,
+                    duration_before=db_, duration_after=da,
+                )
+                getattr(diff, kind).append(seg)
+        for side, delta, f in groups[t]:
+            if delta > 0:
+                active[side][id(f)] = f
+            else:
+                active[side].pop(id(f), None)
+        prev = t
+    return diff
+
+
 def channel_held_intervals(
     events: list[Event], condition: Condition, horizon: float
 ) -> tuple[list[Interval], list[Event]]:
