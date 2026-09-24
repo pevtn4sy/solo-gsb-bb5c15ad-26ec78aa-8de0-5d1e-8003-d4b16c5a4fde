@@ -13,6 +13,7 @@ from .engine import (
     Interval,
     MaintenanceWindow,
     cluster_intervals,
+    diff_faults,
     evaluate_rule,
     to_epoch,
     to_number,
@@ -251,6 +252,78 @@ def evaluate_all_rules() -> dict:
         "suppressed_segments": total_suppressed,
         "maintenance_windows": len(maintenance),
         "per_rule": per_rule,
+    }
+
+
+def _fault_outline(fault) -> dict:
+    """Compact fault payload for the impact preview (evidence is irrelevant)."""
+    return {
+        "rule_id": fault.rule_id,
+        "start": fault.start,
+        "end": fault.end,
+        "duration_required": fault.duration_required,
+        "confirmed_at": fault.confirmed_at,
+    }
+
+
+def preview_rule(rule_id: int | None, draft: dict) -> dict:
+    """Evaluate a not-yet-saved rule draft against the live data, read-only.
+
+    The baseline is the rule *as currently stored* (or nothing for a new
+    rule), the candidate is the unsaved draft.  Both are evaluated right now
+    with the current events and the currently stored planned-maintenance
+    windows — exactly what a save + re-evaluation would see — but nothing is
+    written to the rules or fault tables.  The two confirmed fault sets are
+    compared as half-open interval coverings (see :func:`diff_faults`).
+    """
+    events_by_channel, horizon = _load_events_index()
+    if horizon is None:
+        horizon = 0.0
+    maintenance = _load_maintenance_windows()
+
+    baseline_rule = db.fetch_rule(rule_id) if rule_id is not None else None
+    if rule_id is not None and baseline_rule is None:
+        raise KeyError(f"rule {rule_id} not found")
+
+    def run(rule: dict, rid: int):
+        return evaluate_rule(
+            rule_id=rid,
+            logic=rule["logic"],
+            duration_required=rule["duration"],
+            conditions=[Condition.from_dict(c) for c in rule["conditions"]],
+            events_by_channel=events_by_channel,
+            horizon=horizon,
+            maintenance=maintenance,
+        )
+
+    baseline_result = (
+        run(baseline_rule, baseline_rule["id"]) if baseline_rule is not None else None
+    )
+    draft_result = run(draft, rule_id if rule_id is not None else -1)
+
+    baseline_faults = baseline_result.faults if baseline_result is not None else []
+    segments = diff_faults(baseline_faults, draft_result.faults)
+    counts = {"added": 0, "removed": 0, "overlap_changed": 0, "overlap_unchanged": 0}
+    for seg in segments:
+        counts[seg.kind] += 1
+
+    return {
+        "rule_id": rule_id,
+        "mode": "edit" if baseline_rule is not None else "create",
+        "baseline": {
+            "name": baseline_rule["name"] if baseline_rule is not None else None,
+            "faults": [_fault_outline(f) for f in baseline_faults],
+        },
+        "draft": {
+            "name": draft["name"],
+            "faults": [_fault_outline(f) for f in draft_result.faults],
+        },
+        "maintenance_windows": len(maintenance),
+        "diff": {
+            "segments": [seg.to_dict() for seg in segments],
+            "counts": counts,
+            "changed": counts["added"] + counts["removed"] + counts["overlap_changed"] > 0,
+        },
     }
 
 

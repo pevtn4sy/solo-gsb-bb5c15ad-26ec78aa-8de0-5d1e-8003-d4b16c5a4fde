@@ -70,6 +70,11 @@ class RuleIn(BaseModel):
         }
 
 
+class RulePreviewIn(RuleIn):
+    # None/absent: preview a brand-new rule against an empty baseline.
+    rule_id: int | None = None
+
+
 class AnnotationIn(BaseModel):
     start: Any
     end: Any
@@ -289,6 +294,21 @@ def get_rules() -> list[dict]:
 def create_rule(rule: RuleIn) -> dict:
     rule_id = _insert_rule(rule.normalized())
     return db.fetch_rule(rule_id)
+
+
+@app.post("/api/rules/preview")
+def preview_rule(preview: RulePreviewIn) -> dict:
+    """Preview the impact of an unsaved rule draft without writing anything.
+
+    The stored rule (if ``rule_id`` is given) and the draft are each
+    evaluated against the current events and planned-maintenance windows;
+    the two confirmed fault sets are compared as half-open intervals.  No
+    rule, fault or maintenance row is created or modified.
+    """
+    try:
+        return services.preview_rule(preview.rule_id, preview.normalized())
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
 
 
 @app.get("/api/rules/{rule_id}")

@@ -494,3 +494,137 @@ def evaluate_rule(
                 )
             )
     return RuleEvaluation(faults=faults, suppressed=suppressed)
+
+
+# --------------------------------------------------------------------------- #
+# Fault-set diff (draft-rule impact preview)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class FaultDiffSegment:
+    """One half-open piece of the symmetric comparison of two fault sets.
+
+    kind:
+      * ``"added"``     — covered by a draft fault only;
+      * ``"removed"``   — covered by a baseline fault only;
+      * ``"overlap_changed"`` — covered on both sides but the confirmation
+        instants of the two faults differ (the segment carries both
+        ``baseline_confirmed_at`` and ``draft_confirmed_at``);
+      * ``"overlap_unchanged"`` — covered on both sides with the same
+        confirmation instant.
+    """
+
+    kind: str
+    start: float
+    end: float
+    baseline_confirmed_at: float | None = None
+    draft_confirmed_at: float | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "start": self.start,
+            "end": self.end,
+            "baseline_confirmed_at": self.baseline_confirmed_at,
+            "draft_confirmed_at": self.draft_confirmed_at,
+        }
+
+
+def _coalesce_diff(segments: list[tuple[float, float, str, FaultInterval | None, FaultInterval | None]]) -> list[FaultDiffSegment]:
+    """Join adjacent diff pieces of the same kind and same fault provenance.
+
+    The sweep line may split an otherwise continuous span at a boundary where
+    one side swaps between two of its own faults; pieces of the same kind that
+    merely touch and still come from the same pair of faults are re-joined so
+    the caller sees maximal half-open time pieces.
+    """
+    out: list[FaultDiffSegment] = []
+    for start, end, kind, base, draft in segments:
+        if (
+            out
+            and abs(out[-1].end - start) <= _EPS
+            and out[-1].kind == kind
+            and out[-1].baseline_confirmed_at == (base.confirmed_at if base else None)
+            and out[-1].draft_confirmed_at == (draft.confirmed_at if draft else None)
+        ):
+            out[-1] = FaultDiffSegment(
+                kind=kind,
+                start=out[-1].start,
+                end=end,
+                baseline_confirmed_at=out[-1].baseline_confirmed_at,
+                draft_confirmed_at=out[-1].draft_confirmed_at,
+            )
+        else:
+            out.append(
+                FaultDiffSegment(
+                    kind=kind,
+                    start=start,
+                    end=end,
+                    baseline_confirmed_at=base.confirmed_at if base else None,
+                    draft_confirmed_at=draft.confirmed_at if draft else None,
+                )
+            )
+    return out
+
+
+def diff_faults(
+    baseline: list[FaultInterval], draft: list[FaultInterval]
+) -> list[FaultDiffSegment]:
+    """Compare two confirmed fault sets of the same rule.
+
+    Both sets are compared as half-open interval coverings:
+
+    * time covered by the draft only is emitted as ``added`` pieces;
+    * time covered by the baseline only as ``removed`` pieces;
+    * overlapping time is covered on both sides; when the two faults share
+      the same ``confirmed_at`` it is ``overlap_unchanged``, otherwise
+      ``overlap_changed`` — the interval need not move at all, a shifted
+      confirmation instant alone marks it.
+
+    Fault intervals within one side never overlap (the engine emits merged,
+    disjoint truth segments); the comparison sweeps over the union of both
+    sets' boundaries, so the half-open boundary ``[a,b)`` / ``[b,c)`` never
+    produces a spurious zero-length piece.
+    """
+    starts_base = {f.start: f for f in baseline if f.end > f.start}
+    ends_base = {f.end: f for f in baseline if f.end > f.start}
+    starts_draft = {f.start: f for f in draft if f.end > f.start}
+    ends_draft = {f.end: f for f in draft if f.end > f.start}
+    bounds = sorted(
+        set(starts_base) | set(ends_base) | set(starts_draft) | set(ends_draft)
+    )
+
+    def kind_of(b: FaultInterval | None, d: FaultInterval | None) -> str | None:
+        if b is not None and d is not None:
+            if abs(b.confirmed_at - d.confirmed_at) <= _EPS:
+                return "overlap_unchanged"
+            return "overlap_changed"
+        if d is not None:
+            return "added"
+        if b is not None:
+            return "removed"
+        return None
+
+    raw: list[tuple[float, float, str, FaultInterval | None, FaultInterval | None]] = []
+    active_base: FaultInterval | None = None
+    active_draft: FaultInterval | None = None
+    for i, t in enumerate(bounds):
+        # Apply every boundary event at t atomically: an ending fault leaves
+        # first, a starting one at the same instant takes over (touching
+        # intervals carry no point in the half-open model).
+        if active_base is not None and ends_base.get(t) is active_base:
+            active_base = None
+        if active_draft is not None and ends_draft.get(t) is active_draft:
+            active_draft = None
+        if t in starts_base:
+            active_base = starts_base[t]
+        if t in starts_draft:
+            active_draft = starts_draft[t]
+        if i + 1 >= len(bounds):
+            break
+        kind = kind_of(active_base, active_draft)
+        if kind is not None:
+            raw.append((t, bounds[i + 1], kind, active_base, active_draft))
+
+    return _coalesce_diff(raw)

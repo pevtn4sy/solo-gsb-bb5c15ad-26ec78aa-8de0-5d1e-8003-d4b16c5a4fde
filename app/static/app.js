@@ -21,6 +21,7 @@ const state = {
   selectedFaultId: null,
   editingRuleId: null,
   editingMaintenanceId: null,
+  rulePreview: null,
   eventOffset: 0,
   eventLimit: 200,
   eventTotal: 0,
@@ -173,12 +174,16 @@ function openEditor(ruleId = null) {
   (rule ? rule.conditions : [{}]).forEach((c) => rows.insertAdjacentHTML("beforeend", condRowHtml(c)));
   bindCondRows();
   $("rule-editor").hidden = false;
+  clearRulePreview();
 }
 
 function bindCondRows() {
   $("cond-rows").querySelectorAll(".c-del").forEach((btn) =>
     btn.addEventListener("click", () => {
-      if ($("cond-rows").children.length > 1) btn.closest(".cond-row").remove();
+      if ($("cond-rows").children.length > 1) {
+        btn.closest(".cond-row").remove();
+        markPreviewStale();
+      }
       else toast("至少需要一个条件", true);
     }));
 }
@@ -186,6 +191,7 @@ function bindCondRows() {
 function closeEditor() {
   state.editingRuleId = null;
   $("rule-editor").hidden = true;
+  clearRulePreview();
 }
 
 function collectRule() {
@@ -217,6 +223,118 @@ async function saveRule() {
     await refreshAfterRuleChange();
     toast("规则已保存");
   } catch (e) { toast(e.message, true); }
+}
+
+/* ----------------------- unsaved-draft impact preview ----------------------- */
+
+function clearRulePreview() {
+  state.rulePreview = null;
+  $("rule-preview").hidden = true;
+  $("rule-preview").innerHTML = "";
+}
+
+function markPreviewStale() {
+  if (!state.rulePreview) return;
+  state.rulePreview.stale = true;
+  const banner = $("rule-preview").querySelector(".preview-stale");
+  if (banner) banner.hidden = false;
+}
+
+async function previewRule() {
+  let payload;
+  try {
+    payload = collectRule();
+  } catch (e) { toast(e.message, true); return; }
+  const btn = $("btn-preview-rule");
+  btn.disabled = true;
+  const oldText = btn.textContent;
+  btn.textContent = "评估中…";
+  try {
+    const body = { ...payload, rule_id: state.editingRuleId || null };
+    const result = await api("/api/rules/preview", { method: "POST", body: JSON.stringify(body) });
+    state.rulePreview = { result, stale: false };
+    renderRulePreview();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+}
+
+const PREVIEW_KIND_META = {
+  added: { label: "新增片段", cls: "pv-added", note: "草稿生效后出现的已确认故障时间" },
+  removed: { label: "消失片段", cls: "pv-removed", note: "草稿生效后不再成立的已确认故障时间" },
+  overlap_changed: {
+    label: "确认时刻变化", cls: "pv-changed",
+    note: "区间仍被两侧故障覆盖，但确认时刻发生了变化",
+  },
+  overlap_unchanged: { label: "无变化片段", cls: "pv-same", note: "区间与确认时刻均一致" },
+};
+
+function previewSegmentHtml(seg) {
+  const meta = PREVIEW_KIND_META[seg.kind] || { label: seg.kind, cls: "" };
+  let confirmLine;
+  if (seg.kind === "overlap_changed") {
+    confirmLine = `<span class="pv-confirm">原确认 ${fmtClock(seg.baseline_confirmed_at)} → 草稿确认 ${fmtClock(seg.draft_confirmed_at)}</span>`;
+  } else if (seg.kind === "overlap_unchanged") {
+    confirmLine = `<span class="pv-confirm">确认时刻 ${fmtClock(seg.baseline_confirmed_at)}</span>`;
+  } else if (seg.kind === "added") {
+    confirmLine = `<span class="pv-confirm">草稿确认 ${fmtClock(seg.draft_confirmed_at)}</span>`;
+  } else {
+    confirmLine = `<span class="pv-confirm">原确认 ${fmtClock(seg.baseline_confirmed_at)}</span>`;
+  }
+  return `
+    <div class="pv-seg ${meta.cls}">
+      <span class="pv-kind">${meta.label}</span>
+      <span class="fault-time">${fmtTime(seg.start)} → ${fmtTime(seg.end)}</span>
+      <span class="tag">${fmtDur(seg.end - seg.start)}</span>
+      ${confirmLine}
+    </div>`;
+}
+
+function renderRulePreview() {
+  const box = $("rule-preview");
+  const { result, stale } = state.rulePreview;
+  const c = result.diff.counts;
+  const summary =
+    `原规则 ${result.baseline.faults.length} 个故障 → 草稿 ${result.draft.faults.length} 个故障` +
+    `（当前 ${result.maintenance_windows} 个维护窗口参与评估；不落库，保存仍走原流程）`;
+  const sections = [
+    ["added", c.added],
+    ["removed", c.removed],
+    ["overlap_changed", c.overlap_changed],
+  ];
+  const sectionsHtml = sections.map(([kind, n]) => {
+    if (!n) return "";
+    const meta = PREVIEW_KIND_META[kind];
+    const segs = result.diff.segments.filter((s) => s.kind === kind);
+    return `
+      <div class="pv-group">
+        <div class="pv-group-head ${meta.cls}">${meta.label} <span class="tab-count">${n}</span><span class="muted small"> · ${meta.note}</span></div>
+        ${segs.map(previewSegmentHtml).join("")}
+      </div>`;
+  }).join("");
+
+  const unchangedOpen = result.diff.changed ? "" : "open";
+  const unchangedBody = c.overlap_unchanged
+    ? `<details class="pv-group pv-same-group" ${unchangedOpen}>
+         <summary class="pv-group-head pv-same">无变化片段 <span class="tab-count">${c.overlap_unchanged}</span><span class="muted small"> · 区间与确认时刻均一致（点击展开）</span></summary>
+         ${result.diff.segments.filter((s) => s.kind === "overlap_unchanged").map(previewSegmentHtml).join("")}
+       </details>`
+    : "";
+
+  const noChangeHtml = result.diff.changed ? "" : `
+    <div class="pv-nochange">✓ 草稿与原规则的已确认故障完全一致：无新增、无消失、确认时刻无变化。</div>`;
+
+  box.innerHTML = `
+    <div class="pv-title">预览影响（只读）</div>
+    <div class="pv-summary">${esc(summary)}</div>
+    <div class="preview-stale pv-stale" ${stale ? "" : "hidden"}>草稿在上次预览后已修改，结果可能已过期，请重新预览。</div>
+    ${sectionsHtml}
+    ${unchangedBody}
+    ${noChangeHtml}`;
+  box.hidden = false;
 }
 
 async function deleteRule(id) {
@@ -1181,11 +1299,16 @@ function bind() {
 
   $("btn-new-rule").addEventListener("click", () => openEditor(null));
   $("btn-save-rule").addEventListener("click", saveRule);
+  $("btn-preview-rule").addEventListener("click", previewRule);
   $("btn-cancel-rule").addEventListener("click", closeEditor);
   $("btn-add-cond").addEventListener("click", () => {
     $("cond-rows").insertAdjacentHTML("beforeend", condRowHtml());
     bindCondRows();
+    markPreviewStale();
   });
+  // any edit of the draft invalidates a previously rendered preview
+  $("rule-editor").addEventListener("input", markPreviewStale);
+  $("rule-editor").addEventListener("change", markPreviewStale);
 
   $("btn-new-maint").addEventListener("click", () => openMaintEditor(null));
   $("btn-save-maint").addEventListener("click", saveMaintenance);
